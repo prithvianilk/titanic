@@ -35,7 +35,7 @@ type Titanic struct {
 	addr          string
 	state         ServerState
 	mu            sync.Mutex
-	term          int
+	Term          int
 	lastResetTime time.Time
 	kvmap         map[string]string
 	votedFor      string
@@ -44,7 +44,7 @@ type Titanic struct {
 
 type LogEntry struct {
 	instruction internal.KVPair
-	term        int
+	Term        int
 }
 
 type RequestVoteArgs struct {
@@ -70,7 +70,7 @@ type AppendEntriesReply struct {
 func NewRaftApp() *Titanic {
 	var app Titanic
 	app.addr = ":" + os.Args[1]
-	app.term = 1
+	app.Term = 1
 	app.state = follower
 	app.kvmap = make(map[string]string)
 	return &app
@@ -79,10 +79,12 @@ func NewRaftApp() *Titanic {
 func (app *Titanic) startElectionTimer() {
 	app.mu.Lock()
 	app.lastResetTime = time.Now()
-	currentTerm := app.term
+	currentTerm := app.Term
 	app.mu.Unlock()
+
 	resetCheckTime := time.Millisecond * 10
 	ticker := time.NewTicker(resetCheckTime)
+	defer ticker.Stop()
 	for {
 		<-ticker.C
 		app.mu.Lock()
@@ -92,7 +94,7 @@ func (app *Titanic) startElectionTimer() {
 			return
 		}
 
-		hasTermChanged := app.term != currentTerm
+		hasTermChanged := app.Term != currentTerm
 		if hasTermChanged {
 			app.mu.Unlock()
 			return
@@ -112,10 +114,12 @@ func (app *Titanic) startElectionTimer() {
 
 func (app *Titanic) startNewElection() {
 	app.state = candidate
-	app.term++
+	app.Term++
+	currentTerm := app.Term
 	replicaCount := len(addrs)
+	app.votedFor = app.addr
 	votesReceived := 1
-	fmt.Println("new election")
+	// fmt.Println("new election")
 
 	for _, addr := range addrs {
 		go func(addr string) {
@@ -126,25 +130,31 @@ func (app *Titanic) startNewElection() {
 			if err != nil {
 				return
 			}
-			args := RequestVoteArgs{app.term, app.addr}
+			args := RequestVoteArgs{currentTerm, app.addr}
 			var reply RequestVoteReply
 			err = client.Call("Titanic.RequestVote", args, &reply)
 			if err != nil {
 				return
-			} else if app.state != candidate {
+			}
+			app.mu.Lock()
+			defer app.mu.Unlock()
+			fmt.Println("vote response from " + addr + " " + fmt.Sprint(reply))
+			if app.state != candidate {
 				return
-			} else if reply.Term > app.term {
+			} else if reply.Term > currentTerm {
 				app.makeFollower(reply.Term)
 				return
 			} else if !reply.VoteGranted {
 				return
+			} else if reply.Term == currentTerm {
+				votesReceived++
+				shouldMakeLeader := votesReceived*2 >= replicaCount
+				if shouldMakeLeader {
+					app.makeLeader()
+					return
+				}
 			}
-			votesReceived++
-			shouldMakeLeader := votesReceived*2 >= replicaCount
-			if shouldMakeLeader {
-				app.makeLeader()
-				return
-			}
+
 		}(addr)
 	}
 
@@ -152,7 +162,7 @@ func (app *Titanic) startNewElection() {
 }
 
 func (app *Titanic) makeLeader() {
-	fmt.Println(app.addr + " was elected leader!")
+	fmt.Println(app.addr + " was elected leader! for Term " + fmt.Sprint(app.Term))
 	app.state = leader
 	go func() {
 		ticker := time.NewTicker(heartbeatRepeatDuration)
@@ -160,37 +170,62 @@ func (app *Titanic) makeLeader() {
 		for {
 			<-ticker.C
 			app.sendHeartbeats()
+
+			app.mu.Lock()
+			if app.state != leader {
+				app.mu.Unlock()
+				return
+			}
+			app.mu.Unlock()
 		}
 	}()
 }
 
 func (app *Titanic) sendHeartbeats() {
+	app.mu.Lock()
+	currentTerm := app.Term
+	app.mu.Unlock()
+
 	for _, addr := range addrs {
 		client, err := rpc.DialHTTP("tcp", internal.LocalHostAddr+addr)
 		if err != nil {
 			continue
 		}
-		args := AppendEntriesArgs{}
-		var reply AppendEntriesReply
-		client.Call("Titanic.AppendEntries", args, &reply)
+		args := AppendEntriesArgs{
+			Term: currentTerm,
+		}
+		go func() {
+			var reply AppendEntriesReply
+			err := client.Call("Titanic.AppendEntries", args, &reply)
+			if err != nil {
+				return
+			}
+			app.mu.Lock()
+			defer app.mu.Unlock()
+			if reply.Term > currentTerm {
+				app.makeFollower(reply.Term)
+				return
+			}
+		}()
 	}
 }
 
-func (app *Titanic) makeFollower(term int) {
+func (app *Titanic) makeFollower(Term int) {
 	app.state = follower
-	app.term = term
+	app.Term = Term
 	app.votedFor = invalidVotedFor
 	app.lastResetTime = time.Now()
+	go app.startElectionTimer()
 }
 
 func (app *Titanic) RequestVote(reqVoteArgs *RequestVoteArgs, reqVoteReply *RequestVoteReply) error {
 	app.mu.Lock()
 	defer app.mu.Unlock()
-	if reqVoteArgs.Term > app.term {
+	if reqVoteArgs.Term > app.Term {
 		app.makeFollower(reqVoteArgs.Term)
 	}
 
-	if reqVoteArgs.Term == app.term && (app.votedFor == invalidVotedFor || app.votedFor == reqVoteArgs.CandidateAddr) {
+	if reqVoteArgs.Term == app.Term && (app.votedFor == invalidVotedFor || app.votedFor == reqVoteArgs.CandidateAddr) {
 		app.votedFor = reqVoteArgs.CandidateAddr
 		reqVoteReply.VoteGranted = true
 		app.lastResetTime = time.Now()
@@ -198,28 +233,29 @@ func (app *Titanic) RequestVote(reqVoteArgs *RequestVoteArgs, reqVoteReply *Requ
 		reqVoteReply.VoteGranted = false
 	}
 
-	reqVoteReply.Term = app.term
+	reqVoteReply.Term = app.Term
 	return nil
 }
 
 func (app *Titanic) AppendEntries(appendEntriesArgs *AppendEntriesArgs, appendEntriesReply *AppendEntriesReply) error {
 	app.mu.Lock()
 	defer app.mu.Unlock()
-	if appendEntriesArgs.Term > app.term {
+	if appendEntriesArgs.Term > app.Term {
 		app.makeFollower(appendEntriesArgs.Term)
 	}
 
 	appendEntriesReply.Success = false
 
-	if appendEntriesArgs.Term == app.term {
+	if appendEntriesArgs.Term == app.Term {
 		if app.state != follower {
-			app.makeFollower(app.term)
+			app.makeFollower(app.Term)
 		}
 		app.lastResetTime = time.Now()
+		appendEntriesReply.Success = true
 		app.log = append(app.log, appendEntriesArgs.LogEntry)
 	}
 
-	appendEntriesReply.Term = app.term
+	appendEntriesReply.Term = app.Term
 	return nil
 }
 

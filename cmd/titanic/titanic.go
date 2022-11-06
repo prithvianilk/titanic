@@ -1,6 +1,9 @@
 package main
 
 import (
+	"fmt"
+	"log"
+	"net"
 	"net/http"
 	"net/rpc"
 	"os"
@@ -8,7 +11,6 @@ import (
 
 	"sync"
 
-	"github.com/gin-gonic/gin"
 	"github.com/prithvianilk/titanic/internal"
 )
 
@@ -25,27 +27,56 @@ const (
 	heartbeatRepeatDuration = time.Millisecond * 50
 )
 
+const invalidVotedFor = ""
+
 var addrs = []string{":3530", ":3630", ":6700"}
 
-type RaftApp struct {
+type Titanic struct {
 	addr          string
 	state         ServerState
 	mu            sync.Mutex
 	term          int
 	lastResetTime time.Time
 	kvmap         map[string]string
+	votedFor      string
+	log           []LogEntry
+}
+
+type LogEntry struct {
+	instruction internal.KVPair
+	term        int
 }
 
 type RequestVoteArgs struct {
-	term int
+	Term          int
+	CandidateAddr string
 }
 
 type RequestVoteReply struct {
-	term        int
-	voteGranted bool
+	Term        int
+	VoteGranted bool
 }
 
-func (app *RaftApp) startElectionTimer() {
+type AppendEntriesArgs struct {
+	Term     int
+	LogEntry LogEntry
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func NewRaftApp() *Titanic {
+	var app Titanic
+	app.addr = ":" + os.Args[1]
+	app.term = 1
+	app.state = follower
+	app.kvmap = make(map[string]string)
+	return &app
+}
+
+func (app *Titanic) startElectionTimer() {
 	app.mu.Lock()
 	app.lastResetTime = time.Now()
 	currentTerm := app.term
@@ -79,11 +110,12 @@ func (app *RaftApp) startElectionTimer() {
 	}
 }
 
-func (app *RaftApp) startNewElection() {
+func (app *Titanic) startNewElection() {
 	app.state = candidate
 	app.term++
 	replicaCount := len(addrs)
 	votesReceived := 1
+	fmt.Println("new election")
 
 	for _, addr := range addrs {
 		go func(addr string) {
@@ -94,17 +126,17 @@ func (app *RaftApp) startNewElection() {
 			if err != nil {
 				return
 			}
-			args := RequestVoteArgs{app.term}
+			args := RequestVoteArgs{app.term, app.addr}
 			var reply RequestVoteReply
-			err = client.Call("RequestVote", args, &reply)
+			err = client.Call("Titanic.RequestVote", args, &reply)
 			if err != nil {
 				return
 			} else if app.state != candidate {
 				return
-			} else if reply.term > app.term {
-				app.makeFollower(reply.term)
+			} else if reply.Term > app.term {
+				app.makeFollower(reply.Term)
 				return
-			} else if !reply.voteGranted {
+			} else if !reply.VoteGranted {
 				return
 			}
 			votesReceived++
@@ -119,7 +151,8 @@ func (app *RaftApp) startNewElection() {
 	go app.startElectionTimer()
 }
 
-func (app *RaftApp) makeLeader() {
+func (app *Titanic) makeLeader() {
+	fmt.Println(app.addr + " was elected leader!")
 	app.state = leader
 	go func() {
 		ticker := time.NewTicker(heartbeatRepeatDuration)
@@ -131,7 +164,7 @@ func (app *RaftApp) makeLeader() {
 	}()
 }
 
-func (app *RaftApp) sendHeartbeats() {
+func (app *Titanic) sendHeartbeats() {
 	for _, addr := range addrs {
 		client, err := rpc.DialHTTP("tcp", internal.LocalHostAddr+addr)
 		if err != nil {
@@ -139,50 +172,77 @@ func (app *RaftApp) sendHeartbeats() {
 		}
 		args := AppendEntriesArgs{}
 		var reply AppendEntriesReply
-		client.Call("AppendEntries", args, &reply)
+		client.Call("Titanic.AppendEntries", args, &reply)
 	}
 }
 
-func (app *RaftApp) makeFollower(term int) {
+func (app *Titanic) makeFollower(term int) {
 	app.state = follower
 	app.term = term
+	app.votedFor = invalidVotedFor
 	app.lastResetTime = time.Now()
+}
+
+func (app *Titanic) RequestVote(reqVoteArgs *RequestVoteArgs, reqVoteReply *RequestVoteReply) error {
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	if reqVoteArgs.Term > app.term {
+		app.makeFollower(reqVoteArgs.Term)
+	}
+
+	if reqVoteArgs.Term == app.term && (app.votedFor == invalidVotedFor || app.votedFor == reqVoteArgs.CandidateAddr) {
+		app.votedFor = reqVoteArgs.CandidateAddr
+		reqVoteReply.VoteGranted = true
+		app.lastResetTime = time.Now()
+	} else {
+		reqVoteReply.VoteGranted = false
+	}
+
+	reqVoteReply.Term = app.term
+	return nil
+}
+
+func (app *Titanic) AppendEntries(appendEntriesArgs *AppendEntriesArgs, appendEntriesReply *AppendEntriesReply) error {
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	if appendEntriesArgs.Term > app.term {
+		app.makeFollower(appendEntriesArgs.Term)
+	}
+
+	appendEntriesReply.Success = false
+
+	if appendEntriesArgs.Term == app.term {
+		if app.state != follower {
+			app.makeFollower(app.term)
+		}
+		app.lastResetTime = time.Now()
+		app.log = append(app.log, appendEntriesArgs.LogEntry)
+	}
+
+	appendEntriesReply.Term = app.term
+	return nil
+}
+
+func (app *Titanic) Get(key string, value *string) {
+
+}
+
+func (app *Titanic) Put(kvPair internal.KVPair, success *bool) {
+
 }
 
 func main() {
 	app := NewRaftApp()
 	go app.startElectionTimer()
-	app.startAPIServer()
+	startRPCServer(app)
 }
 
-func (app *RaftApp) Get(key string, value *string) {
-
-}
-
-func (app *RaftApp) Put(kvPair internal.KVPair, success *bool) {
-
-}
-
-func (app *RaftApp) startAPIServer() {
-	router := gin.Default()
-	router.GET("/:key", func(c *gin.Context) {
-		key := c.Param("key")
-		value := app.kvmap[key]
-		c.String(http.StatusOK, value)
-	})
-	router.PUT("/:key/:value", func(c *gin.Context) {
-		key, value := c.Param("key"), c.Param("value")
-		app.kvmap[key] = value
-		c.String(http.StatusOK, "")
-	})
-	router.Run(app.addr)
-}
-
-func NewRaftApp() *RaftApp {
-	var app RaftApp
-	app.addr = ":" + os.Args[1]
-	app.term = 1
-	app.state = follower
-	app.kvmap = make(map[string]string)
-	return &app
+func startRPCServer(app *Titanic) {
+	rpc.Register(app)
+	rpc.HandleHTTP()
+	listener, err := net.Listen("tcp", app.addr)
+	if err != nil {
+		log.Fatal("listen error:", err)
+	}
+	http.Serve(listener, nil)
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/rpc"
+	"os"
 	"time"
 
 	"sync"
@@ -18,14 +19,22 @@ const (
 	candidate
 )
 
-const electionStartDuration = time.Millisecond * 150
+const localHostAddr = "127.0.0.1"
+
+const (
+	electionStartDuration   = time.Millisecond * 150
+	heartbeatRepeatDuration = time.Millisecond * 50
+)
+
+var addrs = []string{":3530", ":3630", ":6700"}
 
 type RaftApp struct {
+	addr          string
 	state         ServerState
 	mu            sync.Mutex
 	term          int
 	lastResetTime time.Time
-	clients       []rpc.Client
+	kvmap         map[string]string
 }
 
 type RequestVoteArgs struct {
@@ -66,27 +75,35 @@ func (app *RaftApp) startElectionTimer() {
 			app.mu.Unlock()
 			return
 		}
+
+		app.mu.Unlock()
 	}
 }
 
 func (app *RaftApp) startNewElection() {
 	app.state = candidate
 	app.term++
-
-	replicaCount := len(app.clients) + 1
+	replicaCount := len(addrs)
 	votesReceived := 1
-	for _, client := range app.clients {
-		go func(client rpc.Client) {
+
+	for _, addr := range addrs {
+		go func(addr string) {
+			if addr == app.addr {
+				return
+			}
+			client, err := rpc.DialHTTP("tcp", localHostAddr+addr)
+			if err != nil {
+				return
+			}
 			args := RequestVoteArgs{app.term}
 			var reply RequestVoteReply
-			err := client.Call("RequestVote", args, &reply)
+			err = client.Call("RequestVote", args, &reply)
 			if err != nil {
 				return
 			} else if app.state != candidate {
 				return
 			} else if reply.term > app.term {
-				app.state = follower
-				app.term = reply.term
+				app.makeFollower(reply.term)
 				return
 			} else if !reply.voteGranted {
 				return
@@ -97,25 +114,68 @@ func (app *RaftApp) startNewElection() {
 				app.makeLeader()
 				return
 			}
-		}(client)
+		}(addr)
 	}
 
 	go app.startElectionTimer()
 }
 
+func (app *RaftApp) makeLeader() {
+	app.state = leader
+	go func() {
+		ticker := time.NewTicker(heartbeatRepeatDuration)
+		defer ticker.Stop()
+		for {
+			<-ticker.C
+			app.sendHeartbeats()
+		}
+	}()
+}
+
+func (app *RaftApp) sendHeartbeats() {
+	for _, addr := range addrs {
+		client, err := rpc.DialHTTP("tcp", localHostAddr+addr)
+		if err != nil {
+			continue
+		}
+		args := AppendEntriesArgs{}
+		var reply AppendEntriesReply
+		client.Call("AppendEntries", args, &reply)
+	}
+}
+
+func (app *RaftApp) makeFollower(term int) {
+	app.state = follower
+	app.term = term
+	app.lastResetTime = time.Now()
+}
+
 func main() {
-	const addr = ":3530"
-	kvmap := make(map[string]string)
+	app := NewRaftApp()
+	go app.startElectionTimer()
+	app.startAPIServer()
+}
+
+func (app *RaftApp) startAPIServer() {
 	router := gin.Default()
 	router.GET("/:key", func(c *gin.Context) {
 		key := c.Param("key")
-		value := kvmap[key]
+		value := app.kvmap[key]
 		c.String(http.StatusOK, value)
 	})
 	router.PUT("/:key/:value", func(c *gin.Context) {
 		key, value := c.Param("key"), c.Param("value")
-		kvmap[key] = value
+		app.kvmap[key] = value
 		c.String(http.StatusOK, "")
 	})
-	router.Run(addr)
+	router.Run(app.addr)
+}
+
+func NewRaftApp() *RaftApp {
+	var app RaftApp
+	app.addr = ":" + os.Args[1]
+	app.term = 1
+	app.state = follower
+	app.kvmap = make(map[string]string)
+	return &app
 }

@@ -20,21 +20,44 @@ const (
 
 const electionStartDuration = time.Millisecond * 150
 
+type KVPair struct {
+	key   string
+	value int
+}
+type LogEntry struct {
+	instruction KVPair
+	term        int
+}
+
 type RaftApp struct {
 	state         ServerState
 	mu            sync.Mutex
 	term          int
 	lastResetTime time.Time
 	clients       []rpc.Client
+	votedFor      int
+	log           []LogEntry
 }
 
 type RequestVoteArgs struct {
-	term int
+	term        int
+	candidateId int
 }
 
 type RequestVoteReply struct {
 	term        int
 	voteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	term         int
+	logEntry     LogEntry
+	leaderCommit int
+}
+
+type AppendEntriesReply struct {
+	term    int
+	success bool
 }
 
 func (app *RaftApp) startElectionTimer() {
@@ -101,6 +124,46 @@ func (app *RaftApp) startNewElection() {
 	}
 
 	go app.startElectionTimer()
+}
+
+func (app *RaftApp) requestVoteRPC(reqVoteArgs *RequestVoteArgs, reqVoteReply *RequestVoteReply) error {
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	if reqVoteArgs.term > app.term {
+		app.makeFollower(reqVoteArgs.term)
+	}
+
+	if reqVoteArgs.term == app.term && (app.votedFor == -1 || app.votedFor == reqVoteArgs.candidateId) {
+		app.votedFor = reqVoteArgs.candidateId
+		reqVoteReply.voteGranted = true
+		app.lastResetTime = time.Now()
+	} else {
+		reqVoteReply.voteGranted = false
+	}
+
+	reqVoteReply.term = app.term
+	return nil
+}
+
+func (app *RaftApp) appendEntriesRPC(appendEntriesArgs *AppendEntriesArgs, appendEntriesReply *AppendEntriesReply) error {
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	if appendEntriesArgs.term > app.term {
+		app.makeFollower(appendEntriesArgs.term)
+	}
+
+	appendEntriesReply.success = false
+
+	if appendEntriesArgs.term == app.term {
+		if app.state != follower {
+			app.makeFollower(app.term)
+		}
+		app.lastResetTime = time.Now()
+		app.log = append(app.log, appendEntriesArgs.logEntry)
+	}
+
+	appendEntriesReply.term = app.term
+	return nil
 }
 
 func main() {

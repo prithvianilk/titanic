@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -18,8 +19,8 @@ type ServerState int
 
 const (
 	follower ServerState = iota
-	leader
 	candidate
+	leader
 )
 
 const (
@@ -30,7 +31,9 @@ const (
 
 const invalidVotedFor = ""
 
-var addrs = []string{":3530", ":3630", ":6700"}
+var addrs = [...]string{":3530", ":3630", ":6700"}
+
+const replicaCount = len(addrs)
 
 type Titanic struct {
 	addr          string
@@ -38,14 +41,14 @@ type Titanic struct {
 	mu            sync.Mutex
 	Term          int
 	lastResetTime time.Time
-	kvmap         map[string]string
 	votedFor      string
+	kvmap         map[string]string
 	log           []LogEntry
 }
 
 type LogEntry struct {
-	instruction internal.KVPair
 	Term        int
+	Instruction internal.KVPair
 }
 
 type RequestVoteArgs struct {
@@ -59,8 +62,9 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LogEntry LogEntry
+	Term        int
+	LogEntry    LogEntry
+	IsHeartbeat bool
 }
 
 type AppendEntriesReply struct {
@@ -68,7 +72,7 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-func NewRaftApp() *Titanic {
+func NewTitanicApp() *Titanic {
 	var app Titanic
 	app.addr = ":" + os.Args[1]
 	app.Term = 1
@@ -167,7 +171,6 @@ func (app *Titanic) makeLeader() {
 		defer ticker.Stop()
 		for {
 			<-ticker.C
-			fmt.Println("sending heartbeats")
 			app.sendHeartbeats()
 
 			app.mu.Lock()
@@ -181,6 +184,7 @@ func (app *Titanic) makeLeader() {
 }
 
 func (app *Titanic) sendHeartbeats() {
+	fmt.Println("Sending heartbeats")
 	app.mu.Lock()
 	currentTerm := app.Term
 	app.mu.Unlock()
@@ -191,7 +195,8 @@ func (app *Titanic) sendHeartbeats() {
 			continue
 		}
 		args := AppendEntriesArgs{
-			Term: currentTerm,
+			Term:        currentTerm,
+			IsHeartbeat: true,
 		}
 		go func(args AppendEntriesArgs) {
 			var reply AppendEntriesReply
@@ -213,7 +218,7 @@ func (app *Titanic) makeFollower(Term int) {
 	if app.state == leader {
 		return
 	}
-	fmt.Printf("making follower, current state: %v\n", app.state)
+	fmt.Printf("Making follower, current state: %v\n", app.state)
 	app.state = follower
 	app.Term = Term
 	app.votedFor = invalidVotedFor
@@ -221,7 +226,7 @@ func (app *Titanic) makeFollower(Term int) {
 	go app.startElectionTimer()
 }
 
-func (app *Titanic) RequestVote(reqVoteArgs *RequestVoteArgs, reqVoteReply *RequestVoteReply) error {
+func (app *Titanic) RequestVote(reqVoteArgs RequestVoteArgs, reqVoteReply *RequestVoteReply) error {
 	app.mu.Lock()
 	defer app.mu.Unlock()
 	if reqVoteArgs.Term > app.Term {
@@ -240,7 +245,7 @@ func (app *Titanic) RequestVote(reqVoteArgs *RequestVoteArgs, reqVoteReply *Requ
 	return nil
 }
 
-func (app *Titanic) AppendEntries(appendEntriesArgs *AppendEntriesArgs, appendEntriesReply *AppendEntriesReply) error {
+func (app *Titanic) AppendEntries(appendEntriesArgs AppendEntriesArgs, appendEntriesReply *AppendEntriesReply) error {
 	app.mu.Lock()
 	defer app.mu.Unlock()
 	if appendEntriesArgs.Term > app.Term {
@@ -255,23 +260,86 @@ func (app *Titanic) AppendEntries(appendEntriesArgs *AppendEntriesArgs, appendEn
 		}
 		app.lastResetTime = time.Now()
 		appendEntriesReply.Success = true
-		app.log = append(app.log, appendEntriesArgs.LogEntry)
+		logEntry := appendEntriesArgs.LogEntry
+		app.log = append(app.log, logEntry)
+		if !appendEntriesArgs.IsHeartbeat {
+			instruction := logEntry.Instruction
+			key, value := instruction.Key, instruction.Value
+			fmt.Printf("PUT %s <- %s\n", key, value)
+			app.kvmap[key] = value
+		}
 	}
 
 	appendEntriesReply.Term = app.Term
 	return nil
 }
 
-func (app *Titanic) Get(key string, value *string) {
-
+func (app *Titanic) Get(key string, value *string) error {
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	val, isPresent := app.kvmap[key]
+	if !isPresent {
+		return errors.New("key does not exist in map. shame on you :)")
+	}
+	*value = val
+	return nil
 }
 
-func (app *Titanic) Put(kvPair internal.KVPair, success *bool) {
+func (app *Titanic) Put(kvPair internal.KVPair, _ *bool) error {
+	app.mu.Lock()
+	if app.state != leader {
+		app.mu.Unlock()
+		return errors.New(app.addr + " is not the leader")
+	}
+	app.mu.Unlock()
 
+	successChannel := make(chan bool)
+
+	for _, addr := range addrs {
+		if addr == app.addr {
+			continue
+		}
+		go func(addr string) {
+			client, err := rpc.DialHTTP("tcp", internal.LocalHostAddr+addr)
+			if err != nil {
+				return
+			}
+			args := AppendEntriesArgs{
+				Term:        app.Term,
+				IsHeartbeat: false,
+				LogEntry:    LogEntry{Instruction: kvPair, Term: app.Term},
+			}
+			var reply AppendEntriesReply
+			err = client.Call("Titanic.AppendEntries", args, &reply)
+			if err != nil || !reply.Success {
+				successChannel <- false
+				return
+			}
+			successChannel <- true
+		}(addr)
+	}
+
+	successCount := 1
+	for success := range successChannel {
+		if success {
+			successCount++
+		}
+		if (successCount * 2) > replicaCount {
+			break
+		}
+	}
+
+	app.mu.Lock()
+	key, value := kvPair.Key, kvPair.Value
+	fmt.Printf("PUT %s <- %s\n", key, value)
+	app.kvmap[key] = value
+	app.mu.Unlock()
+
+	return nil
 }
 
 func main() {
-	app := NewRaftApp()
+	app := NewTitanicApp()
 	go app.startElectionTimer()
 	startRPCServer(app)
 }

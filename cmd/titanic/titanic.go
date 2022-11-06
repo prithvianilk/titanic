@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prithvianilk/titanic/internal"
 )
 
 type ServerState int
@@ -18,8 +19,6 @@ const (
 	leader
 	candidate
 )
-
-const localHostAddr = "127.0.0.1"
 
 const (
 	electionStartDuration   = time.Millisecond * 150
@@ -91,7 +90,7 @@ func (app *RaftApp) startNewElection() {
 			if addr == app.addr {
 				return
 			}
-			client, err := rpc.DialHTTP("tcp", localHostAddr+addr)
+			client, err := rpc.DialHTTP("tcp", internal.LocalHostAddr+addr)
 			if err != nil {
 				return
 			}
@@ -134,7 +133,7 @@ func (app *RaftApp) makeLeader() {
 
 func (app *RaftApp) sendHeartbeats() {
 	for _, addr := range addrs {
-		client, err := rpc.DialHTTP("tcp", localHostAddr+addr)
+		client, err := rpc.DialHTTP("tcp", internal.LocalHostAddr+addr)
 		if err != nil {
 			continue
 		}
@@ -154,6 +153,14 @@ func main() {
 	app := NewRaftApp()
 	go app.startElectionTimer()
 	app.startAPIServer()
+}
+
+func (app *RaftApp) Get(key string, value *string) {
+
+}
+
+func (app *RaftApp) Put(kvPair internal.KVPair, success *bool) {
+
 }
 
 func (app *RaftApp) startAPIServer() {

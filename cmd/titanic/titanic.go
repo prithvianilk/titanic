@@ -23,8 +23,9 @@ const (
 )
 
 const (
-	electionStartDuration   = time.Millisecond * 150
-	heartbeatRepeatDuration = time.Millisecond * 50
+	electionStartDuration   = time.Second * 10
+	heartbeatRepeatDuration = time.Second * 1
+	resetCheckTime          = time.Second * 5
 )
 
 const invalidVotedFor = ""
@@ -78,11 +79,9 @@ func NewRaftApp() *Titanic {
 
 func (app *Titanic) startElectionTimer() {
 	app.mu.Lock()
-	app.lastResetTime = time.Now()
 	currentTerm := app.Term
 	app.mu.Unlock()
 
-	resetCheckTime := time.Millisecond * 10
 	ticker := time.NewTicker(resetCheckTime)
 	defer ticker.Stop()
 	for {
@@ -113,13 +112,13 @@ func (app *Titanic) startElectionTimer() {
 }
 
 func (app *Titanic) startNewElection() {
+	fmt.Println("Starting new election")
 	app.state = candidate
 	app.Term++
 	currentTerm := app.Term
 	replicaCount := len(addrs)
 	app.votedFor = app.addr
 	votesReceived := 1
-	// fmt.Println("new election")
 
 	for _, addr := range addrs {
 		go func(addr string) {
@@ -138,7 +137,7 @@ func (app *Titanic) startNewElection() {
 			}
 			app.mu.Lock()
 			defer app.mu.Unlock()
-			fmt.Println("vote response from " + addr + " " + fmt.Sprint(reply))
+
 			if app.state != candidate {
 				return
 			} else if reply.Term > currentTerm {
@@ -148,13 +147,12 @@ func (app *Titanic) startNewElection() {
 				return
 			} else if reply.Term == currentTerm {
 				votesReceived++
-				shouldMakeLeader := votesReceived*2 >= replicaCount
+				shouldMakeLeader := (votesReceived * 2) > replicaCount
 				if shouldMakeLeader {
 					app.makeLeader()
 					return
 				}
 			}
-
 		}(addr)
 	}
 
@@ -169,6 +167,7 @@ func (app *Titanic) makeLeader() {
 		defer ticker.Stop()
 		for {
 			<-ticker.C
+			fmt.Println("sending heartbeats")
 			app.sendHeartbeats()
 
 			app.mu.Lock()
@@ -194,7 +193,7 @@ func (app *Titanic) sendHeartbeats() {
 		args := AppendEntriesArgs{
 			Term: currentTerm,
 		}
-		go func() {
+		go func(args AppendEntriesArgs) {
 			var reply AppendEntriesReply
 			err := client.Call("Titanic.AppendEntries", args, &reply)
 			if err != nil {
@@ -206,11 +205,15 @@ func (app *Titanic) sendHeartbeats() {
 				app.makeFollower(reply.Term)
 				return
 			}
-		}()
+		}(args)
 	}
 }
 
 func (app *Titanic) makeFollower(Term int) {
+	if app.state == leader {
+		return
+	}
+	fmt.Printf("making follower, current state: %v\n", app.state)
 	app.state = follower
 	app.Term = Term
 	app.votedFor = invalidVotedFor

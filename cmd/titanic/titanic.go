@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/rpc"
@@ -24,7 +25,6 @@ const (
 )
 
 const (
-	electionStartDuration   = time.Second * 10
 	heartbeatRepeatDuration = time.Second * 1
 	resetCheckTime          = time.Second * 5
 )
@@ -82,6 +82,8 @@ func NewTitanicApp() *Titanic {
 }
 
 func (app *Titanic) startElectionTimer() {
+	electionStartDuration := app.getElectionStartDuration()
+
 	app.mu.Lock()
 	currentTerm := app.Term
 	app.mu.Unlock()
@@ -103,8 +105,8 @@ func (app *Titanic) startElectionTimer() {
 			return
 		}
 
-		timeSinceLastReset := time.Since(app.lastResetTime)
-		shouldStartElection := timeSinceLastReset >= electionStartDuration
+		durationSinceLastReset := time.Since(app.lastResetTime)
+		shouldStartElection := durationSinceLastReset >= electionStartDuration
 		if shouldStartElection {
 			app.startNewElection()
 			app.mu.Unlock()
@@ -113,6 +115,11 @@ func (app *Titanic) startElectionTimer() {
 
 		app.mu.Unlock()
 	}
+}
+
+func (app *Titanic) getElectionStartDuration() time.Duration {
+	randValue := rand.Intn(6) + 10 // random value in in range [10, 15]
+	return time.Second * time.Duration(randValue)
 }
 
 func (app *Titanic) startNewElection() {
@@ -279,7 +286,8 @@ func (app *Titanic) Get(key string, value *string) error {
 	defer app.mu.Unlock()
 	val, isPresent := app.kvmap[key]
 	if !isPresent {
-		return errors.New("key does not exist in map. shame on you :)")
+		message := fmt.Sprintf("key %s does not exist in map", key)
+		return errors.New(message)
 	}
 	*value = val
 	return nil
